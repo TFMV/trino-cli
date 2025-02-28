@@ -14,6 +14,8 @@ Trino CLI is a modern terminal-based tool designed to make working with Trino da
 - **Multiple Export Formats**: Export results as CSV, JSON, Arrow, or Parquet
 - **Connection Profiles**: Easily switch between different Trino environments
 - **Intelligent SQL Autocompletion**: Powerful SQL autocompletion system
+- **Persistent Query History**: Track, search, and replay queries across sessions
+- **Interactive Schema Browser**: Navigate catalogs, schemas, tables, and columns in a TUI
 
 ## Installation
 
@@ -72,6 +74,59 @@ trino-cli -e "SELECT * FROM orders LIMIT 10"
 # Execute a query and export results
 trino-cli export --format csv "SELECT * FROM users" > users.csv
 ```
+
+### Query History Management
+
+The Trino CLI records all executed queries to a local SQLite database, allowing you to easily review, search, and replay past queries.
+
+```bash
+# List recent queries
+trino-cli history list
+
+# List with pagination
+trino-cli history list --limit 50 --offset 10
+
+# Search for queries containing specific terms
+trino-cli history search "orders"
+
+# Use fuzzy search for more flexible matching
+trino-cli history search "join users" --fuzzy
+
+# Replay a specific query by its ID
+trino-cli history replay 1630522845123456789
+
+# Clear query history
+trino-cli history clear
+
+# Clear history older than a specific number of days
+trino-cli history clear --days 30
+```
+
+Each history entry includes:
+
+- Unique query ID
+- Timestamp
+- Profile used
+- Execution duration
+- Number of rows returned
+- The SQL query itself
+
+### Schema Browser
+
+The CLI includes an interactive schema browser that allows you to explore the structure of your Trino databases directly from the terminal.
+
+```bash
+# Launch the schema browser
+trino-cli schema browse
+```
+
+In the schema browser:
+
+- Navigate with arrow keys
+- Expand/collapse nodes with Enter
+- Exit with Escape
+- Explore catalogs, schemas, tables, and columns in a hierarchical tree view
+- View detailed column metadata including data types
 
 ### Cache Management
 
@@ -145,7 +200,6 @@ The following features are planned for future releases:
 
 - **Extended UI Features**:
   - Multi-line editing with syntax highlighting
-  - Schema browser
   - Query plan visualization
 
 - **Enterprise Features**:

@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/TFMV/trino-cli/history"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/xitongsys/parquet-go/writer"
@@ -31,6 +32,9 @@ func ExecuteQuery(query string, profile string) (*QueryResult, error) {
 	defer logger.Sync()
 
 	logger.Info("Executing query", zap.String("query", query), zap.String("profile", profile))
+
+	// Record start time for duration calculation
+	startTime := time.Now()
 
 	// Retrieve connection details based on profile
 	db, err := getConnection(profile)
@@ -76,6 +80,15 @@ func ExecuteQuery(query string, profile string) (*QueryResult, error) {
 	if err := rows.Err(); err != nil {
 		logger.Error("Row iteration error", zap.Error(err))
 		return nil, err
+	}
+
+	// Calculate execution duration
+	duration := time.Since(startTime)
+
+	// Record query in history
+	if _, err := history.AddQuery(query, duration, len(result.Rows), profile); err != nil {
+		logger.Warn("Failed to add query to history", zap.Error(err))
+		// Continue anyway - history recording is not critical
 	}
 
 	logger.Info("Query executed successfully", zap.Int("rows_returned", len(result.Rows)))

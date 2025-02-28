@@ -63,6 +63,7 @@ func Execute() {
 	rootCmd.AddCommand(historyCmd)
 	rootCmd.AddCommand(cacheCmd)
 	rootCmd.AddCommand(exportCmd)
+	// The schema command is added in schema.go
 
 	if err := rootCmd.Execute(); err != nil {
 		logger.Error("Command execution error", zap.Error(err))

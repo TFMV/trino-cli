@@ -13,6 +13,7 @@ Trino CLI is a modern terminal-based tool designed to make working with Trino da
 - **Local Result Caching**: Store and replay query results without re-executing queries
 - **Multiple Export Formats**: Export results as CSV, JSON, Arrow, or Parquet
 - **Connection Profiles**: Easily switch between different Trino environments
+- **Intelligent SQL Autocompletion**: Powerful SQL autocompletion system
 
 ## Installation
 
@@ -81,6 +82,28 @@ trino-cli cache list
 # Replay a cached query result
 trino-cli cache replay query_1234 --pretty
 ```
+
+### Intelligent SQL Autocompletion
+
+The Trino CLI features a powerful SQL autocompletion system that helps you write queries faster and with fewer errors:
+
+- **Context-aware suggestions** based on your query structure
+  - After SELECT: suggests columns and functions
+  - After FROM/JOIN: suggests tables and schemas
+  - After WHERE/AND/OR: suggests columns
+  - After ORDER/GROUP: suggests BY
+- **Schema-aware completions** for catalogs, schemas, tables, and columns
+- **Automatic schema refresh** every 10 minutes to keep suggestions up-to-date
+- **Keyword and function suggestions** for SQL syntax
+- **Dynamic suggestion boosting** that learns from your usage patterns, prioritizing frequently used items
+- **Fuzzy matching** for more flexible completions
+
+To use autocompletion:
+
+- Press `Ctrl+Space` to show suggestions based on your current cursor position
+- Navigate suggestions with `Up/Down` arrow keys
+- Press `Tab` or `Enter` to accept a suggestion
+- Press `Esc` to dismiss suggestions
 
 ## Keyboard Shortcuts
 

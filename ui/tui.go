@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/TFMV/trino-cli/autocomplete"
 	"github.com/TFMV/trino-cli/engine"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -20,6 +22,14 @@ func StartInteractive(profile string) {
 
 	log.Info("Starting interactive mode")
 
+	// Start schema cache updater in the background
+	if err := autocomplete.StartSchemaCacheUpdater(10*time.Minute, profile, log); err != nil {
+		log.Warn("Failed to start schema cache updater", zap.Error(err))
+		// Continue anyway - autocomplete will still work with initial data
+	} else {
+		log.Info("Schema cache updater started with 10-minute refresh interval")
+	}
+
 	app := tview.NewApplication()
 	queryHistory := []string{}
 	historyIndex := -1
@@ -30,59 +40,99 @@ func StartInteractive(profile string) {
 		SetLabel("SQL> ").
 		SetFieldWidth(0)
 
-	// Output area to display query results and messages.
-	output := tview.NewTextView().
+	// Results area - will be replaced with a table when results are available
+	resultsArea := tview.NewFlex()
+
+	// Initial welcome message
+	welcomeText := tview.NewTextView().
 		SetDynamicColors(true).
 		SetScrollable(true).
 		SetWrap(false).
-		SetText("Welcome to Trino CLI. Enter your SQL query and press [green]Enter[white].")
+		SetText("Welcome to Trino CLI. Enter your SQL query and press [green]Enter[white].\nPress [yellow]Ctrl+Space[white] for autocompletion.")
+
+	resultsArea.AddItem(welcomeText, 0, 1, false)
 
 	// Status bar to show execution state.
 	statusBar := tview.NewTextView().
 		SetDynamicColors(true).
-		SetText("[blue]Ready[white]").
-		SetTextAlign(tview.AlignLeft)
+		SetText("[yellow]Ready")
 
-	// Layout container.
+	// Layout.
 	flex := tview.NewFlex().
 		SetDirection(tview.FlexRow).
-		AddItem(output, 0, 1, false).
-		AddItem(input, 3, 0, true).
+		AddItem(input, 1, 0, true).
+		AddItem(resultsArea, 0, 1, false).
 		AddItem(statusBar, 1, 0, false)
 
-	// Execute query when Enter is pressed.
+	// Set up autocomplete
+	var autocompleteHandler *autocomplete.AutocompleteHandler
+	autocompleteHandler, err := autocomplete.IntegrateWithTUI(app, input, flex, profile, log)
+	if err != nil {
+		log.Warn("Failed to initialize autocomplete", zap.Error(err))
+		// Continue without autocomplete
+	} else {
+		log.Info("Autocomplete initialized successfully")
+		defer autocompleteHandler.Stop()
+	}
+
+	// Handle query execution.
 	input.SetDoneFunc(func(key tcell.Key) {
 		if key != tcell.KeyEnter {
 			return
 		}
 
-		query := strings.TrimSpace(input.GetText())
-		if query == "" {
+		query := input.GetText()
+		if strings.TrimSpace(query) == "" {
 			return
 		}
 
-		// Store query in history
+		// Add to history.
 		historyLock.Lock()
 		queryHistory = append(queryHistory, query)
 		historyIndex = len(queryHistory)
 		historyLock.Unlock()
 
-		// Update status bar
-		statusBar.SetText("[yellow]Executing query...")
 		log.Info("Executing query", zap.String("query", query))
+		statusBar.SetText("[yellow]Executing query...")
 
 		go func() {
 			result, err := engine.ExecuteQuery(query, profile)
 			app.QueueUpdateDraw(func() {
 				if err != nil {
 					log.Error("Query execution failed", zap.Error(err))
-					output.SetText(fmt.Sprintf("[red]Error:[white] %v", err))
+
+					// Show error message
+					errorText := tview.NewTextView().
+						SetDynamicColors(true).
+						SetScrollable(true).
+						SetWrap(true).
+						SetText(fmt.Sprintf("[red]Error:[white] %v", err))
+
+					// Clear results area and add error message
+					resultsArea.Clear()
+					resultsArea.AddItem(errorText, 0, 1, false)
+
 					statusBar.SetText("[red]Execution failed")
 				} else {
 					log.Info("Query executed successfully",
 						zap.Int("rows", len(result.Rows)),
 						zap.Int("columns", len(result.Columns)))
-					output.SetText(formatResult(result))
+
+					// Create a scrollable table for results
+					resultTable := createResultTable(result, app, input)
+
+					// Set a title showing the number of rows returned
+					resultTable.SetTitle(fmt.Sprintf(" Query Results: %d rows ", len(result.Rows)))
+					resultTable.SetTitleAlign(tview.AlignLeft)
+					resultTable.SetBorderPadding(0, 0, 1, 1)
+
+					// Clear results area and add the table
+					resultsArea.Clear()
+					resultsArea.AddItem(resultTable, 0, 1, false)
+
+					// Set focus on the table to enable scrolling with arrow keys
+					app.SetFocus(resultTable)
+
 					statusBar.SetText("[green]Execution complete")
 				}
 				input.SetText("")
@@ -92,6 +142,11 @@ func StartInteractive(profile string) {
 
 	// Keyboard shortcuts.
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		// First check if autocomplete handler wants to handle this key
+		if autocompleteHandler != nil && autocompleteHandler.ProcessKey(event) {
+			return nil
+		}
+
 		switch event.Key() {
 		case tcell.KeyUp: // Navigate history (previous query)
 			historyLock.Lock()
@@ -133,27 +188,81 @@ func StartInteractive(profile string) {
 	log.Info("TUI application closed")
 }
 
-// formatResult renders query results in a table-like format.
-func formatResult(result *engine.QueryResult) string {
+// createResultTable renders query results as a scrollable, interactive table.
+func createResultTable(result *engine.QueryResult, app *tview.Application, input *tview.InputField) *tview.Table {
 	if len(result.Rows) == 0 {
-		return "[yellow]No results found."
-	}
+		// Return a table with just the header and a "No results" message
+		table := tview.NewTable().SetBorders(true)
 
-	// Column headers
-	output := "[green]" + strings.Join(result.Columns, " | ") + "[white]\n"
-	output += strings.Repeat("-", len(output)) + "\n"
-
-	// Rows
-	for _, row := range result.Rows {
-		rowStrings := make([]string, len(row))
-		for i, val := range row {
-			if val == nil {
-				rowStrings[i] = "NULL"
-			} else {
-				rowStrings[i] = fmt.Sprintf("%v", val)
-			}
+		// Add column headers
+		for colIndex, colName := range result.Columns {
+			table.SetCell(0, colIndex,
+				tview.NewTableCell(colName).
+					SetTextColor(tcell.ColorGreen).
+					SetAlign(tview.AlignLeft).
+					SetExpansion(1))
 		}
-		output += strings.Join(rowStrings, " | ") + "\n"
+
+		// Add "No results" message
+		if len(result.Columns) > 0 {
+			table.SetCell(1, 0,
+				tview.NewTableCell("[yellow]No results found.").
+					SetAlign(tview.AlignLeft).
+					SetSelectable(false))
+		}
+
+		return table
 	}
-	return output
+
+	table := tview.NewTable().
+		SetBorders(true).
+		SetSelectable(true, false) // Allow row selection for easier reading
+
+	// Add column headers with styling
+	for colIndex, colName := range result.Columns {
+		table.SetCell(0, colIndex,
+			tview.NewTableCell(colName).
+				SetTextColor(tcell.ColorGreen).
+				SetAlign(tview.AlignLeft).
+				SetExpansion(1).
+				SetSelectable(false))
+	}
+
+	// Add data rows
+	for rowIndex, row := range result.Rows {
+		for colIndex, value := range row {
+			var cellText string
+			if value == nil {
+				cellText = "NULL"
+			} else {
+				cellText = fmt.Sprintf("%v", value)
+			}
+
+			table.SetCell(rowIndex+1, colIndex, // +1 to account for header row
+				tview.NewTableCell(cellText).
+					SetAlign(tview.AlignLeft).
+					SetExpansion(1))
+		}
+	}
+
+	// Set table properties
+	table.SetFixed(1, 0) // Fix header row
+	table.SetSeparator(tview.Borders.Vertical)
+
+	// Make the table scrollable and selectable
+	table.SetSelectable(true, false)
+	table.SetSelectedStyle(tcell.StyleDefault.Background(tcell.ColorNavy).Foreground(tcell.ColorWhite))
+
+	// Add key handler for the table
+	table.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEscape:
+			// Return focus to the input field when Escape is pressed
+			app.SetFocus(input)
+			return nil
+		}
+		return event
+	})
+
+	return table
 }

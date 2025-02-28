@@ -143,8 +143,6 @@ trino-cli
 - Multiple formats: CSV, JSON, Arrow, Parquet
 - Configurable output destinations
 
-![Export Examples](docs/export-examples.png)
-
 ## How Does Trino CLI Compare
 
 | Feature                   | Trino CLI (This Project)          | Default Trino CLI          | pgcli / mycli            |

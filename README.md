@@ -16,6 +16,7 @@ A high-performance, feature-rich terminal user interface for Trino built with Go
   - [Overview](#overview)
   - [Who is Trino CLI for](#who-is-trino-cli-for)
   - [Quickstart](#quickstart)
+  - [Examples](#examples)
   - [Technology Stack](#technology-stack)
   - [Features](#features)
     - [Interactive Query Interface](#interactive-query-interface)
@@ -50,6 +51,8 @@ A high-performance, feature-rich terminal user interface for Trino built with Go
 ## Overview
 
 Trino CLI is a modern terminal-based interface for [Trino](https://trino.io/) (formerly PrestoSQL), designed to enhance productivity for data engineers and analysts. It provides a rich interactive experience with features like syntax highlighting, intelligent autocompletion, persistent query history, and an interactive schema browser.
+
+See the docs folder for design goals.
 
 ## Who is Trino CLI for
 
@@ -88,6 +91,18 @@ trino-cli -e "SELECT 1 AS test"
 # Start interactive mode
 trino-cli
 ```
+
+## Examples
+
+The examples directory contains a demonstration of:
+
+- Configuration handling
+- Query execution
+- Schema metadata browsing
+- Query history management
+- Result export in multiple formats
+
+See the README in the examples directory for details.
 
 ## Technology Stack
 

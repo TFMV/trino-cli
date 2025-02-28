@@ -43,6 +43,152 @@ func NewSchemaTree() *SchemaTree {
 	}
 }
 
+// SchemaCache provides caching capabilities for schema metadata
+type SchemaCache struct {
+	Data   *SchemaTree
+	Expiry time.Time
+	mu     sync.RWMutex
+}
+
+// NewSchemaCache creates a new schema cache
+func NewSchemaCache() *SchemaCache {
+	return &SchemaCache{
+		Data:   NewSchemaTree(),
+		Expiry: time.Now(),
+	}
+}
+
+// Get returns the cached schema tree if it's still valid, otherwise nil
+func (sc *SchemaCache) Get() *SchemaTree {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	if time.Now().Before(sc.Expiry) {
+		return sc.Data
+	}
+	return nil
+}
+
+// Update updates the schema cache with new data and sets an expiration time
+func (sc *SchemaCache) Update(tree *SchemaTree, duration time.Duration) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.Data = tree
+	sc.Expiry = time.Now().Add(duration)
+}
+
+// HasCatalog checks if a catalog exists in the cache
+func (sc *SchemaCache) HasCatalog(catalog string) bool {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	if sc.Data == nil {
+		return false
+	}
+	_, ok := sc.Data.Catalogs[catalog]
+	return ok && time.Now().Before(sc.Expiry)
+}
+
+// HasSchema checks if a schema exists in the cache
+func (sc *SchemaCache) HasSchema(catalog, schema string) bool {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	if sc.Data == nil {
+		return false
+	}
+	if schemas, ok := sc.Data.Schemas[catalog]; ok {
+		_, ok := schemas[schema]
+		return ok && time.Now().Before(sc.Expiry)
+	}
+	return false
+}
+
+// HasTable checks if a table exists in the cache
+func (sc *SchemaCache) HasTable(catalog, schema, table string) bool {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	if sc.Data == nil {
+		return false
+	}
+	if schemas, ok := sc.Data.Tables[catalog]; ok {
+		if tables, ok := schemas[schema]; ok {
+			_, ok := tables[table]
+			return ok && time.Now().Before(sc.Expiry)
+		}
+	}
+	return false
+}
+
+// GetCatalogs returns all catalogs from the cache
+func (sc *SchemaCache) GetCatalogs() []string {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	if sc.Data == nil || time.Now().After(sc.Expiry) {
+		return nil
+	}
+
+	catalogs := make([]string, 0, len(sc.Data.Catalogs))
+	for catalog := range sc.Data.Catalogs {
+		catalogs = append(catalogs, catalog)
+	}
+	sort.Strings(catalogs)
+	return catalogs
+}
+
+// GetSchemas returns all schemas for a catalog from the cache
+func (sc *SchemaCache) GetSchemas(catalog string) []string {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	if sc.Data == nil || time.Now().After(sc.Expiry) {
+		return nil
+	}
+
+	if schemas, ok := sc.Data.Schemas[catalog]; ok {
+		result := make([]string, 0, len(schemas))
+		for schema := range schemas {
+			result = append(result, schema)
+		}
+		sort.Strings(result)
+		return result
+	}
+	return nil
+}
+
+// GetTables returns all tables for a schema from the cache
+func (sc *SchemaCache) GetTables(catalog, schema string) []string {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	if sc.Data == nil || time.Now().After(sc.Expiry) {
+		return nil
+	}
+
+	if schemas, ok := sc.Data.Tables[catalog]; ok {
+		if tables, ok := schemas[schema]; ok {
+			result := make([]string, 0, len(tables))
+			for table := range tables {
+				result = append(result, table)
+			}
+			sort.Strings(result)
+			return result
+		}
+	}
+	return nil
+}
+
+// GetColumns returns all columns for a table from the cache
+func (sc *SchemaCache) GetColumns(catalog, schema, table string) []Column {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	if sc.Data == nil || time.Now().After(sc.Expiry) {
+		return nil
+	}
+
+	if schemas, ok := sc.Data.Columns[catalog]; ok {
+		if tables, ok := schemas[schema]; ok {
+			return tables[table]
+		}
+	}
+	return nil
+}
+
 // SchemaTreeNode represents a node in the tview tree
 type SchemaTreeNode struct {
 	Type     string // "catalog", "schema", "table", "column"
@@ -57,6 +203,7 @@ type SchemaTreeNode struct {
 // Browser manages the interactive schema browser
 type Browser struct {
 	tree       *SchemaTree
+	cache      *SchemaCache
 	treeView   *tview.TreeView
 	app        *tview.Application
 	infoText   *tview.TextView
@@ -65,6 +212,7 @@ type Browser struct {
 	profile    string
 	rootNode   *tview.TreeNode
 	loadingJob context.CancelFunc
+	dbPool     *sql.DB // Connection pool for better performance
 }
 
 // NewBrowser creates a new schema browser
@@ -90,12 +238,19 @@ func NewBrowser(profileName string, logger *zap.Logger) (*Browser, error) {
 		profile.Catalog,
 		profile.Schema)
 
+	// Create a connection pool instead of a single connection
 	db, err := sql.Open("trino", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
+	// Configure connection pooling
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
 	tree := NewSchemaTree()
+	cache := NewSchemaCache()
 
 	// Set up the tree view
 	rootNode := tview.NewTreeNode("Trino Schema").
@@ -116,9 +271,11 @@ func NewBrowser(profileName string, logger *zap.Logger) (*Browser, error) {
 
 	browser := &Browser{
 		tree:     tree,
+		cache:    cache,
 		treeView: treeView,
 		infoText: infoText,
 		db:       db,
+		dbPool:   db,
 		logger:   logger,
 		profile:  profileName,
 		rootNode: rootNode,
@@ -136,14 +293,156 @@ func (b *Browser) Start() error {
 	// Create a new application
 	b.app = tview.NewApplication()
 
-	// Create a flex layout
-	flex := tview.NewFlex().
+	// Set up title bar
+	titleBar := tview.NewTextView().
+		SetText("Trino Schema Browser - Press Esc to exit").
+		SetTextAlign(tview.AlignCenter).
+		SetTextColor(tcell.ColorWhite)
+
+	// Add borders for better UI
+	b.treeView.SetBorder(true).
+		SetTitle(" Schema Explorer ").
+		SetTitleAlign(tview.AlignLeft).
+		SetTitleColor(tcell.ColorGreen)
+
+	b.infoText.SetBorder(true).
+		SetTitle(" Info ").
+		SetTitleAlign(tview.AlignLeft).
+		SetTitleColor(tcell.ColorBlue)
+
+	// Create a flex layout for the main content area
+	contentFlex := tview.NewFlex().
+		AddItem(b.treeView, 0, 3, true).
+		AddItem(b.infoText, 0, 5, false)
+
+	// Create a search field
+	searchField := tview.NewInputField().
+		SetLabel("Search: ").
+		SetFieldWidth(30).
+		SetDoneFunc(func(key tcell.Key) {
+			// Return focus to the tree view when done
+			b.app.SetFocus(b.treeView)
+		})
+
+	// Add behavior to search field
+	searchField.SetChangedFunc(func(text string) {
+		node := b.treeView.GetCurrentNode()
+		if node == nil {
+			return
+		}
+
+		nodeRef := node.GetReference()
+		if nodeRef == nil {
+			return
+		}
+
+		ref := nodeRef.(*SchemaTreeNode)
+
+		// Handle different node types
+		switch ref.Type {
+		case "catalog":
+			// If we have schemas loaded, search through them
+			schemas := b.cache.GetSchemas(ref.Catalog)
+			if schemas != nil {
+				matchedSchemas := FuzzySearch(text, schemas)
+
+				b.app.QueueUpdateDraw(func() {
+					node.ClearChildren()
+					for _, schema := range matchedSchemas {
+						schemaNode := tview.NewTreeNode(schema).
+							SetReference(&SchemaTreeNode{
+								Type:    "schema",
+								Name:    schema,
+								Catalog: ref.Catalog,
+								Schema:  schema,
+								Loaded:  false,
+							}).
+							SetSelectable(true).
+							SetColor(tcell.ColorLightBlue)
+						node.AddChild(schemaNode)
+					}
+				})
+			}
+		case "schema":
+			// Search tables in this schema
+			tables := b.cache.GetTables(ref.Catalog, ref.Schema)
+			if tables != nil {
+				matchedTables := FuzzySearch(text, tables)
+
+				b.app.QueueUpdateDraw(func() {
+					node.ClearChildren()
+					for _, table := range matchedTables {
+						tableNode := tview.NewTreeNode(table).
+							SetReference(&SchemaTreeNode{
+								Type:    "table",
+								Name:    table,
+								Catalog: ref.Catalog,
+								Schema:  ref.Schema,
+								Table:   table,
+								Loaded:  false,
+							}).
+							SetSelectable(true).
+							SetColor(tcell.ColorLightCyan)
+						node.AddChild(tableNode)
+					}
+				})
+			}
+		case "table":
+			// If we have columns loaded, search through them
+			columns := b.cache.GetColumns(ref.Catalog, ref.Schema, ref.Table)
+			if columns != nil {
+				// Extract column names for searching
+				columnNames := make([]string, len(columns))
+				for i, col := range columns {
+					columnNames[i] = col.Name
+				}
+
+				matchedNames := FuzzySearch(text, columnNames)
+
+				// Find the corresponding Column objects
+				var matchedColumns []Column
+				for _, name := range matchedNames {
+					for _, col := range columns {
+						if col.Name == name {
+							matchedColumns = append(matchedColumns, col)
+							break
+						}
+					}
+				}
+
+				b.app.QueueUpdateDraw(func() {
+					node.ClearChildren()
+					for _, col := range matchedColumns {
+						colNode := tview.NewTreeNode(fmt.Sprintf("%s (%s)", col.Name, col.Type)).
+							SetReference(&SchemaTreeNode{
+								Type:     "column",
+								Name:     col.Name,
+								Catalog:  ref.Catalog,
+								Schema:   ref.Schema,
+								Table:    ref.Table,
+								DataType: col.Type,
+							}).
+							SetSelectable(true).
+							SetColor(tcell.ColorWhite)
+						node.AddChild(colNode)
+					}
+				})
+			}
+		}
+	})
+
+	// Add search field to a flex container
+	searchFlex := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(searchField, 30, 1, false).
+		AddItem(nil, 0, 1, false)
+
+	// Create the main flex layout
+	mainFlex := tview.NewFlex().
 		SetDirection(tview.FlexRow).
-		AddItem(tview.NewTextView().SetText("Trino Schema Browser - Press Esc to exit").SetTextAlign(tview.AlignCenter), 1, 0, false).
-		AddItem(tview.NewFlex().
-			AddItem(b.treeView, 0, 3, true).
-			AddItem(b.infoText, 0, 5, false),
-			0, 1, true)
+		AddItem(titleBar, 1, 0, false).
+		AddItem(searchFlex, 1, 0, false).
+		AddItem(contentFlex, 0, 1, true)
 
 	// Load catalogs in the background after starting the UI
 	go func() {
@@ -153,17 +452,29 @@ func (b *Browser) Start() error {
 		}
 	}()
 
-	// Capture keyboard events
+	// Set keyboard shortcuts
 	b.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEscape {
-			b.app.Stop()
+		switch event.Key() {
+		case tcell.KeyEscape:
+			if b.treeView.HasFocus() {
+				// If the tree has focus, exit the application
+				b.app.Stop()
+				return nil
+			} else {
+				// Otherwise, return focus to the tree
+				b.app.SetFocus(b.treeView)
+				return nil
+			}
+		case tcell.KeyCtrlF, tcell.KeyF3:
+			// Focus the search field
+			b.app.SetFocus(searchField)
 			return nil
 		}
 		return event
 	})
 
 	// Run the application
-	if err := b.app.SetRoot(flex, true).Run(); err != nil {
+	if err := b.app.SetRoot(mainFlex, true).Run(); err != nil {
 		return err
 	}
 
@@ -174,10 +485,30 @@ func (b *Browser) Start() error {
 
 // LoadCatalogs loads the catalogs from Trino
 func (b *Browser) LoadCatalogs() error {
+	// Check if we have this in cache
+	if cachedCatalogs := b.cache.GetCatalogs(); cachedCatalogs != nil {
+		b.logger.Info("Using cached catalogs")
+		b.app.QueueUpdateDraw(func() {
+			for _, catalog := range cachedCatalogs {
+				node := tview.NewTreeNode(catalog).
+					SetReference(&SchemaTreeNode{
+						Type:    "catalog",
+						Name:    catalog,
+						Catalog: catalog,
+						Loaded:  false,
+					}).
+					SetSelectable(true).
+					SetColor(tcell.ColorYellow)
+				b.rootNode.AddChild(node)
+			}
+		})
+		return nil
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	rows, err := b.db.QueryContext(ctx, "SHOW CATALOGS")
+	rows, err := b.dbPool.QueryContext(ctx, "SHOW CATALOGS")
 	if err != nil {
 		return fmt.Errorf("failed to query catalogs: %w", err)
 	}
@@ -206,6 +537,9 @@ func (b *Browser) LoadCatalogs() error {
 	}
 	b.tree.mu.Unlock()
 
+	// Update the cache
+	b.cache.Update(b.tree, 5*time.Minute)
+
 	// Update the UI on the main thread
 	b.app.QueueUpdateDraw(func() {
 		for _, catalog := range catalogs {
@@ -227,6 +561,30 @@ func (b *Browser) LoadCatalogs() error {
 
 // LoadSchemas loads the schemas for a catalog
 func (b *Browser) LoadSchemas(catalog string, node *tview.TreeNode) error {
+	// Check if we have this in cache
+	if cachedSchemas := b.cache.GetSchemas(catalog); cachedSchemas != nil {
+		b.logger.Info("Using cached schemas", zap.String("catalog", catalog))
+		b.app.QueueUpdateDraw(func() {
+			node.ClearChildren()
+			for _, schema := range cachedSchemas {
+				schemaNode := tview.NewTreeNode(schema).
+					SetReference(&SchemaTreeNode{
+						Type:    "schema",
+						Name:    schema,
+						Catalog: catalog,
+						Schema:  schema,
+						Loaded:  false,
+					}).
+					SetSelectable(true).
+					SetColor(tcell.ColorLightBlue)
+				node.AddChild(schemaNode)
+			}
+			nodeRef := node.GetReference().(*SchemaTreeNode)
+			nodeRef.Loaded = true
+		})
+		return nil
+	}
+
 	// Cancel any previous loading job
 	if b.loadingJob != nil {
 		b.loadingJob()
@@ -242,7 +600,7 @@ func (b *Browser) LoadSchemas(catalog string, node *tview.TreeNode) error {
 	})
 
 	query := fmt.Sprintf("SHOW SCHEMAS FROM %s", catalog)
-	rows, err := b.db.QueryContext(ctx, query)
+	rows, err := b.dbPool.QueryContext(ctx, query)
 	if err != nil {
 		b.app.QueueUpdateDraw(func() {
 			node.SetText(catalog)
@@ -286,6 +644,9 @@ func (b *Browser) LoadSchemas(catalog string, node *tview.TreeNode) error {
 	}
 	b.tree.mu.Unlock()
 
+	// Update the cache
+	b.cache.Update(b.tree, 5*time.Minute)
+
 	// Update the UI on the main thread
 	b.app.QueueUpdateDraw(func() {
 		node.ClearChildren()
@@ -312,6 +673,33 @@ func (b *Browser) LoadSchemas(catalog string, node *tview.TreeNode) error {
 
 // LoadTables loads the tables for a schema
 func (b *Browser) LoadTables(catalog, schema string, node *tview.TreeNode) error {
+	// Check if we have this in cache
+	if cachedTables := b.cache.GetTables(catalog, schema); cachedTables != nil {
+		b.logger.Info("Using cached tables",
+			zap.String("catalog", catalog),
+			zap.String("schema", schema))
+		b.app.QueueUpdateDraw(func() {
+			node.ClearChildren()
+			for _, table := range cachedTables {
+				tableNode := tview.NewTreeNode(table).
+					SetReference(&SchemaTreeNode{
+						Type:    "table",
+						Name:    table,
+						Catalog: catalog,
+						Schema:  schema,
+						Table:   table,
+						Loaded:  false,
+					}).
+					SetSelectable(true).
+					SetColor(tcell.ColorLightCyan)
+				node.AddChild(tableNode)
+			}
+			nodeRef := node.GetReference().(*SchemaTreeNode)
+			nodeRef.Loaded = true
+		})
+		return nil
+	}
+
 	// Cancel any previous loading job
 	if b.loadingJob != nil {
 		b.loadingJob()
@@ -327,7 +715,7 @@ func (b *Browser) LoadTables(catalog, schema string, node *tview.TreeNode) error
 	})
 
 	query := fmt.Sprintf("SHOW TABLES FROM %s.%s", catalog, schema)
-	rows, err := b.db.QueryContext(ctx, query)
+	rows, err := b.dbPool.QueryContext(ctx, query)
 	if err != nil {
 		b.app.QueueUpdateDraw(func() {
 			node.SetText(schema)
@@ -374,6 +762,9 @@ func (b *Browser) LoadTables(catalog, schema string, node *tview.TreeNode) error
 	}
 	b.tree.mu.Unlock()
 
+	// Update the cache
+	b.cache.Update(b.tree, 5*time.Minute)
+
 	// Update the UI on the main thread
 	b.app.QueueUpdateDraw(func() {
 		node.ClearChildren()
@@ -401,6 +792,34 @@ func (b *Browser) LoadTables(catalog, schema string, node *tview.TreeNode) error
 
 // LoadColumns loads the columns for a table
 func (b *Browser) LoadColumns(catalog, schema, table string, node *tview.TreeNode) error {
+	// Check if we have this in cache
+	if cachedColumns := b.cache.GetColumns(catalog, schema, table); cachedColumns != nil {
+		b.logger.Info("Using cached columns",
+			zap.String("catalog", catalog),
+			zap.String("schema", schema),
+			zap.String("table", table))
+		b.app.QueueUpdateDraw(func() {
+			node.ClearChildren()
+			for _, col := range cachedColumns {
+				colNode := tview.NewTreeNode(fmt.Sprintf("%s (%s)", col.Name, col.Type)).
+					SetReference(&SchemaTreeNode{
+						Type:     "column",
+						Name:     col.Name,
+						Catalog:  catalog,
+						Schema:   schema,
+						Table:    table,
+						DataType: col.Type,
+					}).
+					SetSelectable(true).
+					SetColor(tcell.ColorWhite)
+				node.AddChild(colNode)
+			}
+			nodeRef := node.GetReference().(*SchemaTreeNode)
+			nodeRef.Loaded = true
+		})
+		return nil
+	}
+
 	// Cancel any previous loading job
 	if b.loadingJob != nil {
 		b.loadingJob()
@@ -416,7 +835,7 @@ func (b *Browser) LoadColumns(catalog, schema, table string, node *tview.TreeNod
 	})
 
 	query := fmt.Sprintf("DESCRIBE %s.%s.%s", catalog, schema, table)
-	rows, err := b.db.QueryContext(ctx, query)
+	rows, err := b.dbPool.QueryContext(ctx, query)
 	if err != nil {
 		b.app.QueueUpdateDraw(func() {
 			node.SetText(table)
@@ -459,6 +878,9 @@ func (b *Browser) LoadColumns(catalog, schema, table string, node *tview.TreeNod
 	}
 	b.tree.Columns[catalog][schema][table] = columns
 	b.tree.mu.Unlock()
+
+	// Update the cache
+	b.cache.Update(b.tree, 5*time.Minute)
 
 	// Update the UI on the main thread
 	b.app.QueueUpdateDraw(func() {
@@ -557,4 +979,65 @@ func (b *Browser) nodeChanged(node *tview.TreeNode) {
 		b.infoText.SetText(fmt.Sprintf("[green]Column:[white] %s\n[green]Type:[white] %s\n[green]Table:[white] %s.%s.%s",
 			ref.Name, ref.DataType, ref.Catalog, ref.Schema, ref.Table))
 	}
+}
+
+// FuzzySearch implements fuzzy matching to quickly find items in a list
+func FuzzySearch(input string, items []string) []string {
+	if input == "" {
+		return items
+	}
+
+	// Convert input to lowercase for case-insensitive matching
+	lowerInput := strings.ToLower(input)
+
+	// Score each item based on similarity to input
+	type scoredItem struct {
+		index     int
+		score     int
+		matchType string // For debugging
+	}
+
+	var scored []scoredItem
+	for i, item := range items {
+		lowerItem := strings.ToLower(item)
+
+		// Simple scoring algorithm - the lower the score, the better the match
+		if lowerItem == lowerInput { // Exact match
+			scored = append(scored, scoredItem{i, 0, "exact"})
+		} else if strings.HasPrefix(lowerItem, lowerInput) { // Prefix match
+			scored = append(scored, scoredItem{i, 1, "prefix"})
+		} else if strings.Contains(lowerItem, lowerInput) { // Contains match
+			// Increase the score for contains matches to ensure they come after prefix matches
+			scored = append(scored, scoredItem{i, 100 + strings.Index(lowerItem, lowerInput), "contains"})
+		} else if lowerInput != "" {
+			// Check for subsequence match (characters in the same order but not consecutive)
+			match := true
+			lastPos := -1
+			for _, c := range lowerInput {
+				pos := strings.IndexRune(lowerItem[lastPos+1:], c)
+				if pos == -1 {
+					match = false
+					break
+				}
+				lastPos += pos + 1
+			}
+
+			if match {
+				scored = append(scored, scoredItem{i, 1000 + lastPos, "subsequence"}) // Subsequence match, lowest priority
+			}
+		}
+	}
+
+	// Sort by score (lower is better)
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].score < scored[j].score
+	})
+
+	// Extract the original items in sorted order
+	result := make([]string, 0, len(scored))
+	for _, s := range scored {
+		result = append(result, items[s.index])
+	}
+
+	return result
 }

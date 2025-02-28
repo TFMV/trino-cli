@@ -3,6 +3,7 @@ module github.com/TFMV/trino-cli
 go 1.24.0
 
 require (
+	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/apache/arrow-go/v18 v18.1.0
 	github.com/gdamore/tcell/v2 v2.7.1
 	github.com/mattn/go-sqlite3 v1.14.24

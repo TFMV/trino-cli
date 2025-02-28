@@ -1,0 +1,2 @@
+# trino-cli
+Trino CLI

@@ -5,6 +5,7 @@ go 1.24.0
 require (
 	github.com/apache/arrow-go/v18 v18.1.0
 	github.com/gdamore/tcell/v2 v2.7.1
+	github.com/mattn/go-sqlite3 v1.14.24
 	github.com/rivo/tview v0.0.0-20241227133733-17b7edb88c57
 	github.com/spf13/cobra v1.9.1
 	github.com/trinodb/trino-go-client v0.321.0
